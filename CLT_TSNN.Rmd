@@ -1,0 +1,1097 @@
+---
+title: "CLT_for_TSNN"
+author: "Tathagata Sadhukhan"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r}
+library(foreach)
+library(doParallel)
+library(matrixStats)
+library(Rcpp)
+library(dplyr)
+library(ggplot2)
+library(scales) 
+library(broom)
+```
+
+```{r}
+cppFunction('
+NumericMatrix compute_distances_rcpp(NumericMatrix X_obs, bool is_row) {
+  int n, m;
+  if (is_row) {
+    n = X_obs.nrow();
+    m = X_obs.ncol();
+  } else {
+    n = X_obs.ncol();
+    m = X_obs.nrow();
+  }
+
+  NumericMatrix distances(n, n);
+
+  for (int i = 0; i < n - 1; ++i) {
+    for (int j = i + 1; j < n; ++j) {
+      std::vector<double> vec1, vec2;
+      for (int k = 0; k < m; ++k) {
+        double val1 = is_row ? X_obs(i, k) : X_obs(k, i);
+        double val2 = is_row ? X_obs(j, k) : X_obs(k, j);
+        if (!NumericVector::is_na(val1) && !NumericVector::is_na(val2)) {
+          vec1.push_back(val1);
+          vec2.push_back(val2);
+        }
+      }
+
+      if (!vec1.empty()) {
+        double dist_val = 0.0;
+        for (size_t k = 0; k < vec1.size(); ++k) {
+          dist_val += (vec1[k] - vec2[k]) * (vec1[k] - vec2[k]);
+        }
+        dist_val /= vec1.size();
+        distances(i, j) = dist_val;
+        distances(j, i) = dist_val;
+      } else {
+        distances(i, j) = R_PosInf;
+        distances(j, i) = R_PosInf;
+      }
+    }
+  }
+
+  return distances;
+}
+')
+```
+
+
+TSNN and coverage evaluator modules
+```{r}
+double_nearest_neighbour_parallel <- function(valid_data, obs_data, percentiles = c(10, 13, 17, 20), row_percentiles = NULL, self_include = FALSE, verbose = FALSE) {
+  best_mse <- Inf
+  best_eta1 <- NA
+  best_eta2 <- NA
+  best_predicted_X <- NA
+  
+  n <- nrow(obs_data)
+  m <- ncol(obs_data)
+  
+  row_distances <- compute_distances_rcpp(obs_data, TRUE)
+  col_distances <- compute_distances_rcpp(obs_data, FALSE)
+  
+  if(is.null(row_percentiles)) {
+    row_percentiles = percentiles
+  }
+  
+  eta1_values <- quantile(row_distances[row_distances != Inf & row_distances > 0], row_percentiles / 100)
+  eta2_values <- quantile(col_distances[col_distances != Inf & col_distances > 0], percentiles / 100)
+  nloop <- length(eta1_values)
+  
+  # Register parallel backend
+  num_cores <- detectCores()
+  
+  results <- mclapply(1:nloop, function(index) {
+    intermediate_results <- NULL
+    eta1 <- eta1_values[index]
+    index_set_of_eta2 <- (max(1, index-2): min(index+2, nloop))
+    range_of_eta2 <- as.numeric(eta2_values[index_set_of_eta2])
+    for(col_index in 1:length(index_set_of_eta2)) {
+      predicted_X <- matrix(NA, nrow(obs_data), ncol(obs_data))
+      for (u in 1:n) {
+        for (i in 1:m) {
+          if(!self_include) {
+            temp <- obs_data[u, i]
+            obs_data[u, i] <- NA 
+          }
+          eta2 <- range_of_eta2[col_index]
+          row_neighbours <- which(row_distances[u, ] <= eta1)
+          col_neighbours <- which(col_distances[i, ] <= eta2)
+          values <- obs_data[row_neighbours, col_neighbours]
+          observed_values <- values[!is.na(values)]
+          if (length(observed_values) > 0) {
+            predicted_X[u, i] <- mean(observed_values)
+          }
+          if(!self_include) {
+            obs_data[u,i] <- temp
+            rm(temp) 
+          }
+        }
+      }
+      mse <- mean((valid_data - predicted_X) ^ 2, na.rm = TRUE)
+      intermediate_results <- rbind(intermediate_results,
+                                    data.frame(eta1 = eta1, eta2 = eta2, mse = mse))
+    }
+    return(intermediate_results)
+  }, mc.cores = num_cores - 2)
+  
+  results <- do.call(rbind, results)
+  # Finding the best MSE and corresponding etas
+  best_result <- results[which.min(results$mse),]
+  best_eta1 <- best_result$eta1
+  best_eta2 <- best_result$eta2
+  best_mse <- best_result$mse
+  row_dist_cdf <- ecdf(row_distances[row_distances != Inf])
+  col_dist_cdf <- ecdf(col_distances[col_distances != Inf])
+  eta1_percentile <- row_dist_cdf(best_eta1)
+  eta2_percentile <- col_dist_cdf(best_eta2)
+  row_neighbours <- list()
+  col_neighbours <- list()
+  for(u in 1:n) {
+    row_neighbours[[u]] <- which(row_distances[u, ] <= best_eta1)
+  }
+  for(i in 1:m) {
+    col_neighbours[[i]] <- which(col_distances[i, ] <= best_eta2)
+  }  
+  if(verbose) {
+    cat(
+      "TS-NN train MSE:", best_mse,
+      "eta1 percentile", eta1_percentile,
+      "eta2 percentile", eta2_percentile,
+      "\n"
+    )
+  }
+  
+  return(
+    list(
+      eta1 = best_eta1,
+      eta2 = best_eta2,
+      mse = best_mse,
+      eta1_percentile = eta1_percentile,
+      eta2_percentile = eta2_percentile,
+      row_neighbors_list = row_neighbours,
+      col_neighbors_list = col_neighbours
+    )
+  )
+}
+is_real_numeric <- function(x) {
+  is.numeric(x) & !is.na(x) & !is.nan(x) & !is.null(x)
+}
+
+tsnn_coverage_evaluator <-
+  function(true_signal, obs_data, row_neighbors_list, col_neighbors_list, verbose = TRUE, self_include = TRUE, alp = 0.05, sig_est = NULL) {
+    predicted_X <- matrix(NA, nrow(obs_data), ncol(obs_data))
+    no_of_ngds <- matrix(0, nrow(obs_data), ncol(obs_data))
+    within_ngd_sd <- matrix(0, nrow(obs_data), ncol(obs_data))
+    for (u in 1:nrow(obs_data)) {
+      for (i in 1:ncol(obs_data)) {
+        row_neighbours <- row_neighbors_list[[u]]
+        col_neighbours <- col_neighbors_list[[i]]
+        if(!self_include) {
+          temp <- obs_data[u, i]
+          obs_data[u, i] <- NA 
+        }
+        values <- obs_data[row_neighbours, col_neighbours]
+        observed_values <- values[!is.na(values)]
+        if (length(observed_values) > 0) {
+          predicted_X[u, i] <- mean(observed_values)
+          no_of_ngds[u, i] <- length(observed_values)
+        }
+        if (length(observed_values) > 1) {
+          within_ngd_sd[u, i] <- sd(observed_values)
+        }
+        if(!self_include) {
+          obs_data[u,i] <- temp
+          rm(temp) 
+        }
+      }
+    }
+    
+    if(is.null(sig_est)){
+      sig_est <- sqrt(mean((obs_data - predicted_X) ^ 2, na.rm = TRUE))
+    }
+    
+    covered <- 0
+    total <- 0
+    zero_ngds <- 0
+    test_obs_matrix <- is_real_numeric(true_signal)
+    
+    for(u in 1:nrow(true_signal)){
+      for(i in 1:ncol(true_signal)){
+        if(test_obs_matrix[u, i]){
+          total = total + 1
+          if(no_of_ngds[u, i] > 0){
+            left_endpt <- predicted_X[u, i] - qnorm(0.975) * (sig_est + within_ngd_sd[u, i]) / sqrt(no_of_ngds[u,i])
+            right_endpt <- predicted_X[u, i] + qnorm(0.975) * (sig_est + within_ngd_sd[u, i]) / sqrt(no_of_ngds[u,i])
+            if(true_signal[u, i] >= left_endpt && true_signal[u, i] <= right_endpt){
+              covered = covered + 1
+            }
+          } else {zero_ngds = zero_ngds + 1}
+        }
+      }
+    }
+    
+    
+    eval_mse <- mean((true_signal - predicted_X) ^ 2, na.rm = TRUE)
+    coverage <- covered / (total - zero_ngds)
+    null_ngds_proportion <- zero_ngds / total
+    
+    cat(
+      "TS-NN test MSE:",
+      eval_mse,
+      "dim:",
+      dim(true_signal),"\n",
+      "TS-NN coverage:",
+      coverage,
+      "\nNull Ngds proportion:",
+      null_ngds_proportion,
+      "\n\n"
+    )
+    
+    return(c(eval_mse, covered, total, zero_ngds))
+}
+
+tsnn_coverage_unadjust_evaluator <-
+  function(true_signal, obs_data, row_neighbors_list, col_neighbors_list, verbose = TRUE, self_include = TRUE, alp = 0.05, sig_est = NULL) {
+    
+    predicted_X <- matrix(NA, nrow(obs_data), ncol(obs_data))
+    no_of_ngds <- matrix(0, nrow(obs_data), ncol(obs_data))
+    for (u in 1:nrow(obs_data)) {
+      for (i in 1:ncol(obs_data)) {
+        row_neighbours <- row_neighbors_list[[u]]
+        col_neighbours <- col_neighbors_list[[i]]
+        if(!self_include) {
+          temp <- obs_data[u, i]
+          obs_data[u, i] <- NA 
+        }
+        values <- obs_data[row_neighbours, col_neighbours]
+        observed_values <- values[!is.na(values)]
+        if (length(observed_values) > 0) {
+          predicted_X[u, i] <- mean(observed_values)
+          no_of_ngds[u, i] <- length(observed_values)
+        }
+        if(!self_include) {
+          obs_data[u,i] <- temp
+          rm(temp) 
+        }
+      }
+    }
+    
+    if(is.null(sig_est)){
+      sig_est <- sqrt(mean((obs_data - predicted_X) ^ 2, na.rm = TRUE))
+    }
+    
+    covered <- 0
+    total <- 0
+    zero_ngds <- 0
+    test_obs_matrix <- is_real_numeric(true_signal)
+    
+    for(u in 1:nrow(true_signal)){
+      for(i in 1:ncol(true_signal)){
+        if(test_obs_matrix[u, i]){
+          total = total + 1
+          if(no_of_ngds[u, i] > 0){
+            left_endpt <- predicted_X[u, i] - qnorm(0.975) * (sig_est) / sqrt(no_of_ngds[u,i])
+            right_endpt <- predicted_X[u, i] + qnorm(0.975) * (sig_est) / sqrt(no_of_ngds[u,i])
+            if(true_signal[u, i] >= left_endpt && true_signal[u, i] <= right_endpt){
+              covered = covered + 1
+            }
+          } else {zero_ngds = zero_ngds + 1}
+        }
+      }
+    }
+    
+    
+    eval_mse <- mean((true_signal - predicted_X) ^ 2, na.rm = TRUE)
+    coverage <- covered / (total - zero_ngds)
+    null_ngds_proportion <- zero_ngds / total
+    
+    cat(
+      "TS-NN test MSE:",
+      eval_mse,
+      "dim:",
+      dim(true_signal),"\n",
+      "TS-NN coverage:",
+      covered / (total - zero_ngds),
+      "\nNull Ngds proportion:",
+      null_ngds_proportion,
+      "\n","\n"
+    )
+    
+    return(c(eval_mse, covered, total, zero_ngds))
+  }
+
+```
+
+Cross-validation modules
+```{r}
+cross_val_coverage <-
+  function(dataset,
+           true_dataset,
+           func,
+           percentiles,
+           eval_func,
+           nfolds = 5,
+           row_percentiles = NULL,
+           verbose = TRUE,
+           self_include = FALSE,
+           eval_self_include = F,
+           seed = 1) {
+    set.seed(seed)
+    n <- nrow(dataset)
+    m <- ncol(dataset)
+    temp <- sample((1 * nfolds), n * m, replace = TRUE)
+    fold_mat <- matrix(temp, nrow = n)
+    cv_results <- matrix(NA, nrow = nfolds, ncol = 4)
+    cat("Empirical SD coverage \n\n")
+    for (fold in 1:nfolds) {
+      test_data <-
+        matrix(ifelse(fold_mat %in% fold, dataset, NA), ncol = ncol(dataset))
+      test_true_signal <-
+        matrix(ifelse(fold_mat %in% fold, true_dataset, NA),
+               ncol = ncol(dataset))
+      train_data <-
+        matrix(ifelse(!(fold_mat %in% fold), dataset, NA), ncol = ncol(dataset))
+      fold_res <-
+        func(
+          train_data,
+          train_data,
+          percentiles,
+          verbose = verbose,
+          self_include = self_include,
+          row_percentiles = row_percentiles
+        )
+      cv_results[fold,] <-
+        eval_func(
+          true_signal = test_true_signal,
+          dataset,
+          row_neighbors_list = fold_res$row_neighbors_list,
+          col_neighbors_list = fold_res$col_neighbors_list,
+          self_include = eval_self_include,
+          sig_est = sqrt(fold_res$mse)
+        )
+    }
+    return(list(
+      cv_coverage = cv_results[,2]/(cv_results[,3] - cv_results[,4]),
+      cv_err_mean = mean(cv_results[,1]),
+      cv_err_sd = sd(cv_results[,1]),
+      cv_raw_data = data.frame(cv_errors = cv_results[,1],
+                               cv_covered_thetas = cv_results[,2],
+                               cv_total = cv_results[,3],
+                               cv_zero_ngd = cv_results[,4])
+    ))
+  }
+
+cross_val_coverage_sig_known <-
+  function(dataset,
+           true_dataset,
+           func,
+           percentiles,
+           eval_func,
+           oracle_sig,
+           nfolds = 5,
+           row_percentiles = NULL,
+           verbose = TRUE,
+           self_include = FALSE,
+           eval_self_include = F,
+           seed = 1) {
+    set.seed(seed)
+    n <- nrow(dataset)
+    m <- ncol(dataset)
+    temp <- sample((1 * nfolds), n * m, replace = TRUE)
+    fold_mat <- matrix(temp, nrow = n)
+    cv_results <- matrix(NA, nrow = nfolds, ncol = 4)
+    cat("True SD coverage \n\n")
+    for (fold in 1:nfolds) {
+      test_data <-
+        matrix(ifelse(fold_mat %in% fold, dataset, NA), ncol = ncol(dataset))
+      test_true_signal <-
+        matrix(ifelse(fold_mat %in% fold, true_dataset, NA),
+               ncol = ncol(dataset))
+      train_data <-
+        matrix(ifelse(!(fold_mat %in% fold), dataset, NA), ncol = ncol(dataset))
+      fold_res <-
+        func(
+          train_data,
+          train_data,
+          percentiles,
+          verbose = verbose,
+          self_include = self_include,
+          row_percentiles = row_percentiles
+        )
+      cv_results[fold,] <-
+        eval_func(
+          true_signal = test_true_signal,
+          dataset,
+          row_neighbors_list = fold_res$row_neighbors_list,
+          col_neighbors_list = fold_res$col_neighbors_list,
+          self_include = eval_self_include,
+          sig_est = oracle_sig
+        )
+    }
+    return(list(
+      cv_coverage = cv_results[,2]/(cv_results[,3] - cv_results[,4]),
+      cv_err_mean = mean(cv_results[,1]),
+      cv_err_sd = sd(cv_results[,1]),
+      cv_raw_data = data.frame(cv_errors = cv_results[,1],
+                               cv_covered_thetas = cv_results[,2],
+                               cv_total = cv_results[,3],
+                               cv_zero_ngd = cv_results[,4])
+    ))
+  }
+
+
+cross_val_coverage_both <-
+  function(dataset,
+           true_dataset,
+           func,
+           percentiles,
+           eval_func,
+           oracle_sig,
+           nfolds = 5,
+           row_percentiles = NULL,
+           verbose = TRUE,
+           self_include = FALSE,
+           eval_self_include = F,
+           seed = 1) {
+    set.seed(seed)
+    n <- nrow(dataset)
+    m <- ncol(dataset)
+    temp <- sample((1 * nfolds), n * m, replace = TRUE)
+    fold_mat <- matrix(temp, nrow = n)
+    cv_results_empirical <- matrix(NA, nrow = nfolds, ncol = 4)
+    cv_results_oracle <- matrix(NA, nrow = nfolds, ncol = 4)
+    for (fold in 1:nfolds) {
+      test_data <-
+        matrix(ifelse(fold_mat %in% fold, dataset, NA), ncol = ncol(dataset))
+      test_true_signal <-
+        matrix(ifelse(fold_mat %in% fold, true_dataset, NA),
+               ncol = ncol(dataset))
+      train_data <-
+        matrix(ifelse(!(fold_mat %in% fold), dataset, NA), ncol = ncol(dataset))
+      fold_res <-
+        func(
+          train_data,
+          train_data,
+          percentiles,
+          verbose = verbose,
+          self_include = self_include,
+          row_percentiles = row_percentiles
+        )
+      cat("Empirical SD coverage \n\n")
+      cv_results_empirical[fold,] <-
+        eval_func(
+          true_signal = test_true_signal,
+          dataset,
+          row_neighbors_list = fold_res$row_neighbors_list,
+          col_neighbors_list = fold_res$col_neighbors_list,
+          self_include = eval_self_include,
+          sig_est = sqrt(fold_res$mse)
+        )
+      cat("Oracle SD coverage \n\n")
+      cv_results_oracle[fold,] <-
+        eval_func(
+          true_signal = test_true_signal,
+          dataset,
+          row_neighbors_list = fold_res$row_neighbors_list,
+          col_neighbors_list = fold_res$col_neighbors_list,
+          self_include = eval_self_include,
+          sig_est = oracle_sig
+        )
+    }
+    return(list(
+      cv_coverage_empirical = cv_results_empirical[,2]/(cv_results_empirical[,3] - cv_results_empirical[,4]),
+      cv_err_mean_empirical = mean(cv_results_empirical[,1]),
+      cv_err_sd_empirical = sd(cv_results_empirical[,1]),
+      cv_raw_data_empirical = data.frame(cv_errors = cv_results_empirical[,1],
+                               cv_covered_thetas = cv_results_empirical[,2],
+                               cv_total = cv_results_empirical[,3],
+                               cv_zero_ngd = cv_results_empirical[,4]),
+      cv_coverage_oracle = cv_results_oracle[,2]/(cv_results_oracle[,3] - cv_results_oracle[,4]),
+      cv_err_mean_oracle = mean(cv_results_oracle[,1]),
+      cv_err_sd_oracle = sd(cv_results_oracle[,1]),
+      cv_raw_data_oracle = data.frame(cv_errors = cv_results_oracle[,1],
+                               cv_covered_thetas = cv_results_oracle[,2],
+                               cv_total = cv_results_oracle[,3],
+                               cv_zero_ngd = cv_results_oracle[,4])
+    ))
+  }
+
+
+```
+
+Experimentation modules
+```{r}
+coverage_res_dataset <- function(mode, mcar_setup = NULL, mnar_setup = NULL, seed_collection = 1:10, percentiles = NULL, row_percentiles = NULL) {
+  miss_prob <- 0.5
+  mnar_deter <- TRUE
+  if(grepl(mode, "MCAR", ignore.case = T)){
+    N_values <- mcar_setup$N_values
+    rho <- mcar_setup$rho
+    noise_sigma <- sqrt(mcar_setup$noise_sigma)
+    snr <- mcar_setup$snr
+    miss_prob <- mcar_setup$miss_prob
+  }
+  else if(grepl(mode, "MNAR", ignore.case = T)){
+    N_values <- mnar_setup$N_values
+    rho <- mnar_setup$rho
+    noise_sigma <- sqrt(mnar_setup$noise_sigma)
+    snr <- mnar_setup$snr
+    mnar_deter <- mnar_setup$mnar_deter
+  }
+  
+  # percentiles <- c(1, 1.5, seq(2, 8, by = 1), 10)
+  if(is.null(percentiles)) {
+    # percentiles <- c(seq(1, 2.5, by = 0.5), seq(3, 5, by = 1), seq(6, 12, by = 0.5), 15, 30, 40, 50)
+    # percentiles <- c(seq(1.5, 5, 0.25), seq(5.5, 8, 0.5), 9, 10)
+    percentiles <- c(seq(2.5, 5.5, 0.25), seq(6, 10, 0.5), 12, 18, 30)
+  }
+  if(is.null(row_percentiles)) {
+    row_percentiles <- percentiles
+  }
+  
+  results <- data.frame(
+    N = integer(),
+    Sigma_type = character(),
+    Coverage = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for(N in N_values){
+    for(seed in seed_collection){
+      syn_data <- synthetic_data_gen(N = N, Ts = N, rho = rho, sig_noise = noise_sigma, seed = seed, snr = snr, mode = mode, miss_prob, mnar_deter)
+      data_mat <- syn_data$observed_data
+      true_data <- syn_data$full_data_true
+      noise_sigma <- syn_data$noise_sd
+      ans_tsnn <-
+        cross_val_coverage(
+          dataset = data_mat,
+          true_dataset = true_data,
+          func = double_nearest_neighbour_parallel,
+          percentiles = percentiles,
+          eval_func = tsnn_coverage_evaluator,
+          row_percentiles = percentiles,
+          eval_self_include = F,
+          verbose = T
+        )
+      
+      
+      ans_tsnn_known_sig <-
+        cross_val_coverage_sig_known(
+          dataset = data_mat,
+          true_dataset = true_data,
+          func = double_nearest_neighbour_parallel,
+          percentiles = percentiles,
+          oracle_sig = noise_sigma,
+          eval_func = tsnn_coverage_evaluator,
+          row_percentiles = percentiles,
+          eval_self_include = F,
+          verbose = T
+        )
+      
+      results <- rbind(results,
+                       data.frame(N = N, Sigma_type = "Empirical SD", Coverage = mean(ans_tsnn$cv_coverage)))
+      
+      results <- rbind(results,
+                       data.frame(N = N, Sigma_type = "True SD", Coverage = mean(ans_tsnn_known_sig$cv_coverage)))
+      
+      
+      # for(i in 1:length(ans_tsnn$cv_coverage)) {
+      #   results <- rbind(results,
+      #                    data.frame(N = N, Sigma_type = "Empirical SD", Coverage = ans_tsnn$cv_coverage[i]))
+      # }
+      # 
+      # for(i in 1:length(ans_tsnn_known_sig$cv_coverage)) {
+      #   results <- rbind(results,
+      #                    data.frame(N = N, Sigma_type = "True SD", Coverage = ans_tsnn_known_sig$cv_coverage[i]))
+      # }
+      
+      
+    }
+  }
+  # summary_results <- results
+  
+  summary_results <- aggregate(
+    Coverage ~ N + Sigma_type,
+    data = results,
+    FUN = function(x)
+      c(mean = mean(x), std = sd(x), x)
+  )
+  
+  # Splitting the mean and std into separate columns
+  summary_results$Mean_Coverage <- summary_results[, 3][, 1]
+  summary_results$Std_Coverage <- summary_results[, 3][, 2]
+  summary_results$Coverage <- summary_results[,3][,3:dim(summary_results[,3])[2]]
+  
+  return(summary_results)
+}
+
+coverage_res_dataset_both <- function(mode, mcar_setup = NULL, mnar_setup = NULL, seed_collection = 1:10, percentiles = NULL, row_percentiles = NULL) {
+  miss_prob <- 0.5
+  mnar_deter <- TRUE
+  if(grepl(mode, "MCAR", ignore.case = T)){
+    N_values <- mcar_setup$N_values
+    rho <- mcar_setup$rho
+    noise_sigma <- sqrt(mcar_setup$noise_sigma)
+    snr <- mcar_setup$snr
+    miss_prob <- mcar_setup$miss_prob
+  }
+  else if(grepl(mode, "MNAR", ignore.case = T)){
+    N_values <- mnar_setup$N_values
+    rho <- mnar_setup$rho
+    noise_sigma <- sqrt(mnar_setup$noise_sigma)
+    snr <- mnar_setup$snr
+    mnar_deter <- mnar_setup$mnar_deter
+  }
+  
+  # percentiles <- c(1, 1.5, seq(2, 8, by = 1), 10)
+  if(is.null(percentiles)) {
+    # percentiles <- c(seq(1, 2.5, by = 0.5), seq(3, 5, by = 1), seq(6, 12, by = 0.5), 15, 30, 40, 50)
+    # percentiles <- c(seq(1.5, 5, 0.25), seq(5.5, 8, 0.5), 9, 10)
+    percentiles <- c(seq(2.5, 5.5, 0.25), seq(6, 10, 0.5), 12, 18, 30)
+  }
+  if(is.null(row_percentiles)) {
+    row_percentiles <- percentiles
+  }
+  
+  results <- data.frame(
+    N = integer(),
+    Sigma_type = character(),
+    Coverage = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for(N in N_values){
+    for(seed in seed_collection){
+      syn_data <- synthetic_data_gen(N = N, Ts = N, rho = rho, sig_noise = noise_sigma, seed = seed, snr = snr, mode = mode, miss_prob, mnar_deter)
+      data_mat <- syn_data$observed_data
+      true_data <- syn_data$full_data_true
+      noise_sigma <- syn_data$noise_sd
+      ans_tsnn <-
+        cross_val_coverage_both(
+          dataset = data_mat,
+          true_dataset = true_data,
+          func = double_nearest_neighbour_parallel,
+          percentiles = percentiles,
+          eval_func = tsnn_coverage_evaluator,
+          oracle_sig = noise_sigma,
+          row_percentiles = percentiles,
+          eval_self_include = T,
+          verbose = T
+        )
+      
+      
+      
+      
+      results <- rbind(results,
+                       data.frame(N = N, Sigma_type = "Empirical SD", Coverage = mean(ans_tsnn$cv_coverage_empirical)))
+      
+      results <- rbind(results,
+                       data.frame(N = N, Sigma_type = "True SD", Coverage = mean(ans_tsnn$cv_coverage_oracle)))
+      
+      
+      # for(i in 1:length(ans_tsnn$cv_coverage)) {
+      #   results <- rbind(results,
+      #                    data.frame(N = N, Sigma_type = "Empirical SD", Coverage = ans_tsnn$cv_coverage[i]))
+      # }
+      # 
+      # for(i in 1:length(ans_tsnn_known_sig$cv_coverage)) {
+      #   results <- rbind(results,
+      #                    data.frame(N = N, Sigma_type = "True SD", Coverage = ans_tsnn_known_sig$cv_coverage[i]))
+      # }
+      
+      
+    }
+  }
+  # summary_results <- results
+  
+  summary_results <- aggregate(
+    Coverage ~ N + Sigma_type,
+    data = results,
+    FUN = function(x)
+      c(mean = mean(x), std = sd(x), x)
+  )
+  
+  # Splitting the mean and std into separate columns
+  summary_results$Mean_Coverage <- summary_results[, 3][, 1]
+  summary_results$Std_Coverage <- summary_results[, 3][, 2]
+  summary_results$Coverage <- summary_results[,3][,3:dim(summary_results[,3])[2]]
+  
+  return(summary_results)
+}
+
+
+unadjusted_coverage_res_dataset <- function(mode, mcar_setup = NULL, mnar_setup = NULL, seed_collection = 1:10, percentiles = NULL, row_percentiles = NULL) {
+  miss_prob <- 0.5
+  mnar_deter <- TRUE
+  if(grepl(mode, "MCAR", ignore.case = T)){
+    N_values <- mcar_setup$N_values
+    rho <- mcar_setup$rho
+    noise_sigma <- sqrt(mcar_setup$noise_sigma)
+    snr <- mcar_setup$snr
+    miss_prob <- mcar_setup$miss_prob
+  }
+  else if(grepl(mode, "MNAR", ignore.case = T)){
+    N_values <- mnar_setup$N_values
+    rho <- mnar_setup$rho
+    noise_sigma <- sqrt(mnar_setup$noise_sigma)
+    snr <- mnar_setup$snr
+    mnar_deter <- mnar_setup$mnar_deter
+  }
+  
+  # percentiles <- c(1, 1.5, seq(2, 8, by = 1), 10)
+  if(is.null(percentiles)) {
+    # percentiles <- c(seq(1, 2.5, by = 0.5), seq(3, 5, by = 1), seq(6, 12, by = 0.5), 15, 30, 40, 50)
+    percentiles <- c(seq(2.5, 5.5, 0.3), seq(6, 10, 0.8), 15)
+    # percentiles <- c(seq(2.5, 5.5, 0.25), seq(6, 10, 0.5), 12, 18, 30)
+  }
+  if(is.null(row_percentiles)) {
+    row_percentiles <- percentiles
+  }
+  
+  results <- data.frame(
+    N = integer(),
+    Sigma_type = character(),
+    Coverage = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for(N in N_values){
+    for(seed in seed_collection){
+      syn_data <- synthetic_data_gen(N = N, Ts = N, rho = rho, sig_noise = noise_sigma, seed = seed, snr = snr, mode = mode, miss_prob, mnar_deter)
+      data_mat <- syn_data$observed_data
+      true_data <- syn_data$full_data_true
+      noise_sigma <- syn_data$noise_sd
+      cat("Error var: ", noise_sigma^2, "\n")
+      ans_tsnn <-
+        cross_val_coverage(
+          dataset = data_mat,
+          true_dataset = true_data,
+          func = double_nearest_neighbour_parallel,
+          percentiles = percentiles,
+          eval_func = tsnn_coverage_unadjust_evaluator,
+          row_percentiles = percentiles,
+          eval_self_include = F,
+          verbose = T
+        )
+      
+      
+      ans_tsnn_known_sig <-
+        cross_val_coverage_sig_known(
+          dataset = data_mat,
+          true_dataset = true_data,
+          func = double_nearest_neighbour_parallel,
+          percentiles = percentiles,
+          oracle_sig = noise_sigma,
+          eval_func = tsnn_coverage_unadjust_evaluator,
+          row_percentiles = percentiles,
+          eval_self_include = F,
+          verbose = T
+        )
+      
+      results <- rbind(results,
+                       data.frame(N = N, Sigma_type = "Empirical SD", Coverage = mean(ans_tsnn$cv_coverage)))
+      
+      results <- rbind(results,
+                       data.frame(N = N, Sigma_type = "True SD", Coverage = mean(ans_tsnn_known_sig$cv_coverage)))
+      
+      
+      # for(i in 1:length(ans_tsnn$cv_coverage)) {
+      #   results <- rbind(results,
+      #                    data.frame(N = N, Sigma_type = "Empirical SD", Coverage = ans_tsnn$cv_coverage[i]))
+      # }
+      # 
+      # for(i in 1:length(ans_tsnn_known_sig$cv_coverage)) {
+      #   results <- rbind(results,
+      #                    data.frame(N = N, Sigma_type = "True SD", Coverage = ans_tsnn_known_sig$cv_coverage[i]))
+      # }
+      
+      
+    }
+  }
+  # summary_results <- results
+  
+  summary_results <- aggregate(
+    Coverage ~ N + Sigma_type,
+    data = results,
+    FUN = function(x)
+      c(mean = mean(x), std = sd(x), x)
+  )
+  
+  # Splitting the mean and std into separate columns
+  summary_results$Mean_Coverage <- summary_results[, 3][, 1]
+  summary_results$Std_Coverage <- summary_results[, 3][, 2]
+  summary_results$Coverage <- summary_results[,3][,3:dim(summary_results[,3])[2]]
+  
+  return(summary_results)
+}
+
+unadjusted_coverage_res_dataset_both <- function(mode, mcar_setup = NULL, mnar_setup = NULL, seed_collection = 1:10, percentiles = NULL, row_percentiles = NULL) {
+  miss_prob <- 0.5
+  mnar_deter <- TRUE
+  if(grepl(mode, "MCAR", ignore.case = T)){
+    N_values <- mcar_setup$N_values
+    rho <- mcar_setup$rho
+    noise_sigma <- sqrt(mcar_setup$noise_sigma)
+    snr <- mcar_setup$snr
+    miss_prob <- mcar_setup$miss_prob
+  }
+  else if(grepl(mode, "MNAR", ignore.case = T)){
+    N_values <- mnar_setup$N_values
+    rho <- mnar_setup$rho
+    noise_sigma <- sqrt(mnar_setup$noise_sigma)
+    snr <- mnar_setup$snr
+    mnar_deter <- mnar_setup$mnar_deter
+  }
+  
+  # percentiles <- c(1, 1.5, seq(2, 8, by = 1), 10)
+  if(is.null(percentiles)) {
+    # percentiles <- c(seq(1, 2.5, by = 0.5), seq(3, 5, by = 1), seq(6, 12, by = 0.5), 15, 30, 40, 50)
+    # percentiles <- c(seq(1.5, 5, 0.25), seq(5.5, 8, 0.5), 9, 10)
+    percentiles <- c(seq(2.5, 5.5, 0.25), seq(6, 10, 0.5), 12, 18, 30)
+  }
+  if(is.null(row_percentiles)) {
+    row_percentiles <- percentiles
+  }
+  
+  results <- data.frame(
+    N = integer(),
+    Sigma_type = character(),
+    Coverage = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for(N in N_values){
+    for(seed in seed_collection){
+      syn_data <- synthetic_data_gen(N = N, Ts = N, rho = rho, sig_noise = noise_sigma, seed = seed, snr = snr, mode = mode, miss_prob, mnar_deter)
+      data_mat <- syn_data$observed_data
+      true_data <- syn_data$full_data_true
+      noise_sigma <- syn_data$noise_sd
+      cat("Error var: ", noise_sigma^2, "\n")
+      ans_tsnn <-
+        cross_val_coverage_both(
+          dataset = data_mat,
+          true_dataset = true_data,
+          func = double_nearest_neighbour_parallel,
+          percentiles = percentiles,
+          eval_func = tsnn_coverage_unadjust_evaluator,
+          oracle_sig = noise_sigma,
+          row_percentiles = percentiles,
+          eval_self_include = T,
+          verbose = T
+        )
+      
+      
+      
+      
+      results <- rbind(results,
+                       data.frame(N = N, Sigma_type = "Empirical SD", Coverage = mean(ans_tsnn$cv_coverage_empirical)))
+      
+      results <- rbind(results,
+                       data.frame(N = N, Sigma_type = "True SD", Coverage = mean(ans_tsnn$cv_coverage_oracle)))
+      
+      
+      # for(i in 1:length(ans_tsnn$cv_coverage)) {
+      #   results <- rbind(results,
+      #                    data.frame(N = N, Sigma_type = "Empirical SD", Coverage = ans_tsnn$cv_coverage[i]))
+      # }
+      # 
+      # for(i in 1:length(ans_tsnn_known_sig$cv_coverage)) {
+      #   results <- rbind(results,
+      #                    data.frame(N = N, Sigma_type = "True SD", Coverage = ans_tsnn_known_sig$cv_coverage[i]))
+      # }
+      
+      
+    }
+  }
+  # summary_results <- results
+  
+  summary_results <- aggregate(
+    Coverage ~ N + Sigma_type,
+    data = results,
+    FUN = function(x)
+      c(mean = mean(x), std = sd(x), x)
+  )
+  
+  # Splitting the mean and std into separate columns
+  summary_results$Mean_Coverage <- summary_results[, 3][, 1]
+  summary_results$Std_Coverage <- summary_results[, 3][, 2]
+  summary_results$Coverage <- summary_results[,3][,3:dim(summary_results[,3])[2]]
+  
+  return(summary_results)
+}
+
+
+coverage_graph_plotter <- function(summary_results, rho, mode) {
+  colors <- c( "True SD" = "orange", "Empirical SD" = "green")
+  
+  custom_shapes <- c("Empirical SD" = 19, "True SD" = 15)
+  
+  # custom_linetypes <- c("Empirical SD" = "solid", "true SD" = "solid")
+  
+  custom_linewidths <- c("Empirical SD" = 2, "True SD" = 1.5)
+  
+  gg <- ggplot(summary_results, aes(x = N, y = Mean_Coverage, color = Sigma_type, shape = Sigma_type, size = Sigma_type, group = Sigma_type)) +
+    # geom_smooth(method = "lm", se = FALSE, alpha = 0.4) +
+    geom_line() +
+    geom_point(size = 7.5, alpha = 0.9) +
+    scale_color_manual(values = colors,
+                       labels = c("Empirical SD", "True SD")) +
+    scale_shape_manual(values = custom_shapes) +  
+    # scale_linetype_manual(values = custom_linetypes) + 
+    scale_size_manual(values = custom_linewidths) + 
+    guides(color = guide_legend(override.aes = list(shape = custom_shapes, size = custom_linewidths)),
+           shape = "none", size = "none") +  
+    geom_errorbar(aes(ymin = Mean_Coverage - 1 * Std_Coverage, ymax = Mean_Coverage + 1 * Std_Coverage), width = 5, alpha = 0.7, linetype = 'solid') +
+    theme_minimal() +
+    theme(
+      axis.title.x = element_text(size = 30),
+      axis.title.y = element_text(size = 30),
+      axis.text.x = element_text(size = 25),
+      axis.text.y = element_text(size = 25),
+      legend.title = element_blank(), 
+      legend.text = element_text(size = 22),
+      axis.line = element_line(size = 1.2, color = "black") , 
+      plot.title = element_text(size = 30, face = "bold", hjust = 0.5),
+      legend.position = c(0.2, 0.2) 
+    ) +
+    labs(
+      x = "#Rows n( = #Columns m)",
+      y = "Coverage Rate"
+    ) +
+    geom_hline(yintercept = 0.95, linetype = "dashed")
+  print(gg)
+  return(gg)
+}
+```
+
+Mulitple experimentation area
+```{r}
+# mcar_setup <-
+#   list(
+# N_values = c(150, 400, 500),
+# # N_values = 250,
+# rho = 1,
+# noise_sigma = 0.05,
+# snr = 2,
+# miss_prob = 0.5
+#   )
+# rho <- mcar_setup$rho
+mnar_setup <-
+  list(
+    N_values = c(50, 150),
+    rho = 1,
+    noise_sigma = 0.1,
+    snr = 2,
+    mnar_deter = T
+  )
+rho <- mnar_setup$rho
+mode <- "MNAR"
+seed_collection <- 1:2
+percentiles <- c(seq(2.5, 5.5, 0.25), seq(6, 10, 1), 12, 15, 18, 24, 30)
+
+
+res <-
+  coverage_res_dataset(
+    mode,
+    mcar_setup = mcar_setup,
+    mnar_setup = mnar_setup,
+    seed_collection = seed_collection
+  )
+ 
+gg <- coverage_graph_plotter(res)
+
+filename <- "Coverage_MNAR_lamb0.75.pdf"
+pdf(filename, height = 8, width = 10)
+print(gg)
+# coverage_graph_plotter(res_mcar_lamb1_backup)
+dev.off()
+
+
+unadjusted_res <- unadjusted_coverage_res_dataset_both(mode,
+                                                  mcar_setup = mcar_setup,
+                                                  mnar_setup = mnar_setup,
+                                                  seed_collection = seed_collection,
+                                                  percentiles = percentiles)
+
+
+gg1 <- coverage_graph_plotter(unadjusted_res)
+filename <- "Unadjusted_Coverage_MNAR_lamb1.pdf"
+pdf(filename, height = 8, width = 10)
+print(gg1)
+# coverage_graph_plotter(res_mcar_lamb1_backup)
+dev.off()
+```
+
+Backuping important results
+```{r}
+# res_mcar_lamb1_backup <- res
+# res_mcar_lamb0.5_backup <- res
+# res_mcar_lamb0.6_backup <- res
+
+
+# res_mnar_lamb0.75_backup <- res
+# res_mnar_lamb1_backup <- res
+## p = 0.5
+# res_mcar_lamb0.75_backup <- res
+# res_mcar_lamb1_backup_p0.5 <- res
+
+
+#unadjusted coverage 
+# uadj_res_mnar_lamb1_backup <- res
+```
+
+
+
+Individual Experimentation area
+```{r}
+N = 200
+rho = 1
+noise_sigma = 0.05
+snr = 2
+miss_prob = 0.5
+seed = 2
+mode = "MNAR"
+
+syn_data <- synthetic_data_gen(N = N, Ts = N, rho = rho, sig_noise = sqrt(noise_sigma), seed = seed, snr = snr, mode = mode, miss_prob, mnar_deter)
+data_mat <- syn_data$observed_data
+true_data <- syn_data$full_data_true
+noise_sigma <- syn_data$noise_sd
+noise_sigma^2
+
+# percentiles <- c(seq(2.5, 5, 0.25), 5.5, seq(6, 10, 1))
+percentiles <- c(seq(2.5, 5.5, 0.25), seq(6, 10, 1), 12, 15, 18, 24, 30)
+
+
+ans_tsnn <-
+  cross_val_coverage(
+    dataset = data_mat,
+    true_dataset = true_data,
+    func = double_nearest_neighbour_parallel,
+    percentiles = percentiles,
+    eval_func = tsnn_coverage_evaluator,
+    row_percentiles = percentiles,
+    eval_self_include = F,
+    verbose = T
+  )
+
+
+ans_tsnn_known_sig <-
+  cross_val_coverage_sig_known(
+    dataset = data_mat,
+    true_dataset = true_data,
+    func = double_nearest_neighbour_parallel,
+    percentiles = percentiles,
+    oracle_sig = noise_sigma,
+    eval_func = tsnn_coverage_evaluator,
+    row_percentiles = percentiles,
+    eval_self_include = F,
+    verbose = T
+  )
+
+
+ans_tsnn_unadjust_sig <-
+  cross_val_coverage(
+    dataset = data_mat,
+    true_dataset = true_data,
+    func = double_nearest_neighbour_parallel,
+    percentiles = percentiles,
+    eval_func = tsnn_coverage_unadjust_evaluator,
+    row_percentiles = percentiles,
+    eval_self_include = F,
+    verbose = T
+  )
+
+```
+
+
+
+
+
